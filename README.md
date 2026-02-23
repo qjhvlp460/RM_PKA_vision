@@ -63,8 +63,7 @@ cd ~/auto-aim
 ```bash
 # 克隆代码（请替换为实际仓库地址）
 cd ~/auto-aim/src
-git clone <your-repository-url>
-
+git clone https://github.com/qjhvlp460/RM_PKA_vision
 # 编译项目（支持热更新）
 cd ~/auto-aim
 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
