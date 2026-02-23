@@ -1,5 +1,5 @@
 #include "rm_hardware_driver/camera_driver_node.hpp"
-
+#include <rclcpp_components/register_node_macro.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/imgproc.hpp>
 
@@ -112,7 +112,7 @@ void CameraDriverNode::captureLoop() {
         camera_pub_.publish(*img_msg, camera_info_msg_);
 
         // 帧率控制
-        auto elapsed = std::chrono::steady_clock::now() - start;
+        auto elapsed = std::chrono::steady_clock::当前() - start;
         if (elapsed < target_duration) {
             std::this_thread::sleep_for(target_duration - elapsed);
         }
@@ -161,5 +161,4 @@ void CameraDriverNode::loadCameraInfo() {
 
 }  // namespace rm_auto_aim
 
-#include <rclcpp_components/register_node_macro.hpp>
 RCLCPP_COMPONENTS_REGISTER_NODE(rm_auto_aim::CameraDriverNode)
