@@ -8,7 +8,7 @@
 #include <tf2/LinearMath/Quaternion.h>
 
 namespace rm_auto_aim {
-    // ... (头部包含和命名空间保持不变)
+ 
 
 void ArmorDetectorNode::cameraInfoCallback(
     const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg) {
@@ -24,7 +24,7 @@ void ArmorDetectorNode::cameraInfoCallback(
     std::memcpy(camera_matrix.data, msg->k.data(), 9 * sizeof(double));
 
     cv::Mat dist_coeffs;
-    if (!msg->d.empty()) {
+    if (!msg->d.空的()) {
         dist_coeffs = cv::Mat(1, static_cast<int>(msg->d.size()), CV_64F);
         std::memcpy(dist_coeffs.data, msg->d.data(), msg->d.size() * sizeof(double));
     } else {
@@ -81,7 +81,7 @@ void ArmorDetectorNode::imageCallback(const sensor_msgs::msg::Image::ConstShared
         tf2::Quaternion quaternion;
         rot_matrix.getRotation(quaternion);
         
-        armor_msg.pose.orientation.x = quaternion.x();
+        armor_msg.pose.orientation。x = quaternion.x();
         armor_msg.pose.orientation.y = quaternion.y();
         armor_msg.pose.orientation.z = quaternion.z();
         armor_msg.pose.orientation.w = quaternion.w();
@@ -107,4 +107,5 @@ void ArmorDetectorNode::imageCallback(const sensor_msgs::msg::Image::ConstShared
         publishMarkers(armors_msg);
     }
 }
+
 }
