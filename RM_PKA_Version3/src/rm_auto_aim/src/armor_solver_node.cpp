@@ -1,111 +1,216 @@
-#include "rm_auto_aim/detector/armor_detector_node.hpp"
+#include "rm_auto_aim/solver/armor_solver_node.hpp"
 
-#include <cv_bridge/cv_bridge.h>
-
-#include <geometry_msgs/msg/pose.hpp>
-#include <opencv2/calib3d.hpp>
-#include <tf2/LinearMath/Matrix3x3.h>
-#include <tf2/LinearMath/Quaternion.h>
+#include <cmath>
 
 namespace rm_auto_aim {
- 
 
-void ArmorDetectorNode::cameraInfoCallback(
-    const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg) {
-    if (cam_info_received_) return;
+ArmorSolverNode::ArmorSolverNode(const rclcpp::NodeOptions& options)
+    : Node("armor_solver", options)
+{
+    RCLCPP_INFO(get_logger(), "ArmorSolverNode 初始化中...");
 
-    // 验证相机内参矩阵尺寸
-    if (msg->k.size() != 9) {
-        RCLCPP_ERROR(get_logger(), "相机内参矩阵K必须有9个元素");
-        return;
+    declareParameters();
+    loadParams();
+
+    // 初始化跟踪器
+    tracker_ = std::make_unique<ArmorTracker>();
+    // 从参数加载tracker配置（在loadParams中完成）
+
+    // 订阅装甲板检测结果
+    armors_sub_ = this->create_subscription<rm_interfaces::msg::Armors>(
+        "/detector/armors", rclcpp::SensorDataQoS(),
+        std::bind(&ArmorSolverNode::armorsCallback, this, std::placeholders::_1));
+
+    // 发布目标信息
+    target_pub_ = this->create_publisher<rm_interfaces::msg::Target>(
+        "/solver/target", rclcpp::SensorDataQoS());
+
+    // 发布云台控制命令
+    gimbal_cmd_pub_ = this->create_publisher<rm_interfaces::msg::GimbalCmd>(
+        "/solver/gimbal_cmd", rclcpp::SensorDataQoS());
+
+    RCLCPP_INFO(get_logger(), "ArmorSolverNode 初始化完成");
+}
+
+void ArmorSolverNode::declareParameters() {
+    // EKF过程噪声
+    this->declare_parameter("ekf.sigma2_q_x", 0.008);
+    this->declare_parameter("ekf.sigma2_q_y", 0.008);
+    this->declare_parameter("ekf.sigma2_q_z", 0.008);
+    this->declare_parameter("ekf.sigma2_q_yaw", 1.30);
+    this->declare_parameter("ekf.sigma2_q_r", 98.0);
+    // EKF观测噪声
+    this->declare_parameter("ekf.r_x", 0.0005);
+    this->declare_parameter("ekf.r_y", 0.0005);
+    this->declare_parameter("ekf.r_z", 0.0005);
+    this->declare_parameter("ekf.r_yaw", 0.005);
+    // 跟踪器参数
+    this->declare_parameter("tracker.max_match_distance", 0.5);
+    this->declare_parameter("tracker.max_match_yaw_diff", 0.67);
+    this->declare_parameter("tracker.tracking_thres", 3);
+    this->declare_parameter("tracker.lost_time_thres", 3.05);
+    // 弹道参数
+    this->declare_parameter("solver.bullet_speed", 30.0);
+    this->declare_parameter("solver.gravity", 9.82);
+    this->declare_parameter("solver.resistance", 0.092);
+    // 反陀螺参数
+    this->declare_parameter("solver.max_tracking_v_yaw", 60.0);
+    this->declare_parameter("solver.side_angle", 15.0);
+    this->declare_parameter("solver.coming_angle", 1.222);
+    this->declare_parameter("solver.leaving_angle", 0.524);
+    // 调试
+    this->declare_parameter("debug", false);
+}
+
+void ArmorSolverNode::loadParams() {
+    // 弹道参数
+    bullet_speed_ = this->get_parameter("solver.bullet_speed").as_double();
+    gravity_ = this->get_parameter("solver.gravity").as_double();
+    resistance_ = this->get_parameter("solver.resistance").as_double();
+    trajectory_compensator_.setParams(bullet_speed_, gravity_, resistance_);
+
+    // 反陀螺
+    max_tracking_v_yaw_ = this->get_parameter("solver.max_tracking_v_yaw").as_double();
+    side_angle_ = this->get_parameter("solver.side_angle").as_double();
+    coming_angle_ = this->get_parameter("solver.coming_angle").as_double();
+    leaving_angle_ = this->get_parameter("solver.leaving_angle").as_double();
+
+    debug_ = this->get_parameter("debug").as_bool();
+}
+
+void ArmorSolverNode::armorsCallback(
+    const rm_interfaces::msg::Armors::ConstSharedPtr& msg)
+{
+    // 计算dt
+    rclcpp::Time now = msg->header.stamp;
+    double dt = 0.01;  // 默认10ms
+    if (!first_frame_) {
+        dt = (now - last_time_).seconds();
+        if (dt <= 0 || dt > 1.0) dt = 0.01;
     }
+    first_frame_ = false;
+    last_time_ = now;
 
-    cv::Mat camera_matrix(3, 3, CV_64F);
-    std::memcpy(camera_matrix.data, msg->k.data(), 9 * sizeof(double));
+    // 更新跟踪器（含EKF预测+更新）
+    tracker_->update(*msg, dt);
 
-    cv::Mat dist_coeffs;
-    if (!msg->d.空的()) {
-        dist_coeffs = cv::Mat(1, static_cast<int>(msg->d.size()), CV_64F);
-        std::memcpy(dist_coeffs.data, msg->d.data(), msg->d.size() * sizeof(double));
+    // 构造Target消息
+    rm_interfaces::msg::Target target_msg;
+    target_msg.header = msg->header;
+
+    auto tracker_state = tracker_->state();
+    if (tracker_state == TrackerState::TRACKING ||
+        tracker_state == TrackerState::TEMP_LOST) {
+        target_msg.tracking = true;
+        target_msg.id = tracker_->trackedId();
+        target_msg.armors_num = tracker_->targetArmorsNum();
+
+        auto state = tracker_->getState();
+        // EKF状态: [xc, v_xc, yc, v_yc, zc, v_zc, yaw, v_yaw, r, d_zc]
+        target_msg.position.x = state(0);
+        target_msg.position.y = state(2);
+        target_msg.position.z = state(4);
+        target_msg.velocity.x = state(1);
+        target_msg.velocity.y = state(3);
+        target_msg.velocity.z = state(5);
+        target_msg.yaw = state(6);
+        target_msg.v_yaw = state(7);
+        target_msg.radius_1 = state(8);
+        target_msg.d_zc = state(9);
+
+        // 计算瞄准点
+        double v_yaw = state(7);
+        Eigen::Vector3d aim_point = calcAimPoint(state, v_yaw);
+
+        // 弹道补偿：计算pitch
+        double compensated_pitch = trajectory_compensator_.compensate(
+            aim_point.x(), aim_point.y(), aim_point.z());
+
+        // 计算yaw
+        double yaw_cmd = std::atan2(aim_point.x(), aim_point.z());
+
+        // 手动补偿
+        double dist = aim_point.norm();
+        auto manual_comp = manual_compensator_.getCompensation(dist);
+        compensated_pitch += manual_comp.pitch_offset;
+        yaw_cmd += manual_comp.yaw_offset;
+
+        // 发布云台控制命令
+        rm_interfaces::msg::GimbalCmd gimbal_cmd;
+        gimbal_cmd.header = msg->header;
+        gimbal_cmd.yaw = yaw_cmd;
+        gimbal_cmd.pitch = compensated_pitch;
+        gimbal_cmd.fire = (tracker_state == TrackerState::TRACKING);
+        gimbal_cmd_pub_->publish(gimbal_cmd);
+
     } else {
-        dist_coeffs = cv::Mat::zeros(1, 5, CV_64F);
+        target_msg.tracking = false;
     }
 
-    pnp_solver_ = std::make_unique<PnPSolver>(camera_matrix, dist_coeffs);
-    cam_info_received_ = true;
-    RCLCPP_INFO(get_logger(), "相机内参已接收，PnP解算器初始化完成");
+    target_pub_->publish(target_msg);
 }
 
-void ArmorDetectorNode::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
-    if (!cam_info_received_) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                            "等待相机内参，暂不处理图像");
-        return;
+Eigen::Vector3d ArmorSolverNode::calcAimPoint(
+    const Eigen::VectorXd& state, double v_yaw)
+{
+    if (isSmallGyro(v_yaw)) {
+        // 小陀螺模式：选择最优装甲板
+        return selectBestArmor(state, tracker_->targetArmorsNum());
     }
 
-    auto cv_image = cv_bridge::toCvShare(msg, "bgr8");
-    auto armors = detector_->detect(cv_image->image, detect_color_);
+    // 直接瞄准预测的装甲板位置
+    double xc = state(0), yc = state(2), zc = state(4);
+    double yaw = state(6), r = state(8), d_zc = state(9);
 
-    rm_interfaces::msg::Armors armors_msg;
-    armors_msg.header = msg->header;
+    Eigen::Vector3d aim;
+    aim.x() = xc - r * std::cos(yaw);
+    aim.y() = yc - r * std::sin(yaw);
+    aim.z() = zc + d_zc;
 
-    cv::Point2f image_center(cv_image->image.cols * 0.5f, cv_image->image.rows * 0.5f);
-
-    for (auto& armor : armors) {
-        cv::Mat rotation_vec, translation_vec;
-        double estimated_yaw;
-        
-        if (!pnp_solver_->solve(armor, rotation_vec, translation_vec, estimated_yaw)) {
-            continue;
-        }
-
-        rm_interfaces::msg::Armor armor_msg;
-        armor_msg.number = armor.number;
-        armor_msg.type = (armor.type == ArmorType::SMALL) ? "small" : "large";
-        armor_msg.distance_to_image_center = cv::norm(armor.center() - image_center);
-
-        // 位置
-        armor_msg.pose.position.x = translation_vec.at<double>(0);
-        armor_msg.pose.position.y = translation_vec.at<double>(1);
-        armor_msg.pose.position.z = translation_vec.at<double>(2);
-
-        // 旋转矩阵转四元数
-        cv::Mat rotation_matrix;
-        cv::Rodrigues(rotation_vec, rotation_matrix);
-        
-        tf2::Matrix3x3 rot_matrix(
-            rotation_matrix.at<double>(0, 0), rotation_matrix.at<double>(0, 1), rotation_matrix.at<double>(0, 2),
-            rotation_matrix.at<double>(1, 0), rotation_matrix.at<double>(1, 1), rotation_matrix.at<double>(1, 2),
-            rotation_matrix.at<double>(2, 0), rotation_matrix.at<double>(2, 1), rotation_matrix.at<double>(2, 2));
-        
-        tf2::Quaternion quaternion;
-        rot_matrix.getRotation(quaternion);
-        
-        armor_msg.pose.orientation。x = quaternion.x();
-        armor_msg.pose.orientation.y = quaternion.y();
-        armor_msg.pose.orientation.z = quaternion.z();
-        armor_msg.pose.orientation.w = quaternion.w();
-
-        armors_msg.armors.push_back(armor_msg);
-    }
-
-    armors_pub_->publish(armors_msg);
-
-    // 调试发布
-    if (debug_) {
-        auto binary_img = detector_->getBinaryImage();
-        auto debug_img = detector_->getDebugImage();
-        
-        if (!binary_img.empty()) {
-            auto binary_msg = cv_bridge::CvImage(msg->header, "mono8", binary_img).toImageMsg();
-            binary_pub_.publish(binary_msg);
-        }
-        if (!debug_img.empty()) {
-            auto debug_msg = cv_bridge::CvImage(msg->header, "bgr8", debug_img).toImageMsg();
-            debug_img_pub_.publish(debug_msg);
-        }
-        publishMarkers(armors_msg);
-    }
+    return aim;
 }
 
+bool ArmorSolverNode::isSmallGyro(double v_yaw) const {
+    return std::abs(v_yaw) > max_tracking_v_yaw_;
 }
+
+Eigen::Vector3d ArmorSolverNode::selectBestArmor(
+    const Eigen::VectorXd& state, int armors_num)
+{
+    double xc = state(0), yc = state(2), zc = state(4);
+    double yaw = state(6), r = state(8), d_zc = state(9);
+
+    // 计算所有装甲板位置
+    double angle_step = 2.0 * M_PI / armors_num;
+    double min_yaw_diff = std::numeric_limits<double>::max();
+    Eigen::Vector3d best_point;
+
+    for (int i = 0; i < armors_num; i++) {
+        double armor_yaw = yaw + i * angle_step;
+
+        // 归一化到[-pi, pi]
+        while (armor_yaw > M_PI) armor_yaw -= 2 * M_PI;
+        while (armor_yaw < -M_PI) armor_yaw += 2 * M_PI;
+
+        Eigen::Vector3d armor_pos;
+        armor_pos.x() = xc - r * std::cos(armor_yaw);
+        armor_pos.y() = yc - r * std::sin(armor_yaw);
+        armor_pos.z() = zc + ((i % 2 == 0) ? d_zc : -d_zc);
+
+        // 选择正对相机的那块装甲板（yaw最接近0的）
+        double yaw_to_cam = std::atan2(armor_pos.x(), armor_pos.z());
+        double yaw_diff = std::abs(yaw_to_cam);
+
+        if (yaw_diff < min_yaw_diff) {
+            min_yaw_diff = yaw_diff;
+            best_point = armor_pos;
+        }
+    }
+
+    return best_point;
+}
+
+}  
+
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(rm_auto_aim::ArmorSolverNode)
