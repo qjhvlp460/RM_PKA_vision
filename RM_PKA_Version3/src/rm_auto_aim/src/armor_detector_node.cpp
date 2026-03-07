@@ -107,4 +107,7 @@ void ArmorDetectorNode::imageCallback(const sensor_msgs::msg::Image::ConstShared
         publishMarkers(armors_msg);
     }
 }
+
 }
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(rm_auto_aim::ArmorDetectorNode)
